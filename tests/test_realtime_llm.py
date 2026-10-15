@@ -1234,3 +1234,147 @@ async def test_reply_transcript_is_reported_as_spoken_text():
     assert spoken.will_be_spoken is True
     assert spoken.append_to_context is not False
     assert announced.text == spoken.text == "The capital is Rome."
+
+
+def _ready_service_with_context(messages):
+    service = CapturingBosonRealtimeLLMService()
+    service._api_session_ready = True
+    service._llm_needs_conversation_setup = False
+    context = LLMContext(list(messages))
+    service._context = context
+    service._remember_context_messages(context)
+    return service, context
+
+
+@pytest.mark.asyncio
+async def test_typed_text_added_by_the_context_aggregator_gets_a_reply():
+    # RTVI send-text reaches the user context aggregator first; it adds the
+    # message to the shared context and pushes the updated context downstream.
+    service, context = _ready_service_with_context([{"role": "assistant", "content": "Hi there."}])
+    context.add_messages([{"role": "user", "content": "What is the capital of Italy?"}])
+
+    await service._handle_context(context)
+
+    assert [event["type"] for event in service.sent[-2:]] == ["conversation.item.create", "response.create"]
+    assert service.sent[-2]["item"]["role"] == "user"
+    assert service.sent[-2]["item"]["content"][0]["text"] == "What is the capital of Italy?"
+
+    # The same context pushed again sends nothing new.
+    sent = len(service.sent)
+    await service._handle_context(context)
+    assert len(service.sent) == sent
+
+
+@pytest.mark.asyncio
+async def test_spoken_turn_written_back_to_the_context_is_not_sent_again():
+    service, context = _ready_service_with_context([])
+    await service.handle_evt_input_audio_transcription_completed(
+        SimpleNamespace(
+            type="conversation.item.input_audio_transcription.completed",
+            item_id="item_1",
+            content_index=0,
+            transcript="What is the capital of Italy?",
+        )
+    )
+    context.add_messages([{"role": "user", "content": "What is the capital of  Italy?"}])
+    sent = len(service.sent)
+
+    await service._handle_context(context)
+
+    assert not [e for e in service.sent[sent:] if e["type"] in ("conversation.item.create", "response.create")]
+
+
+def _sent_texts(service, since):
+    return [
+        e["item"]["content"][0]["text"]
+        for e in service.sent[since:]
+        if e["type"] == "conversation.item.create" and e["item"].get("type") == "message"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_spoken_turn_joined_from_several_transcripts_is_not_sent_again():
+    service, context = _ready_service_with_context([])
+    for item_id, transcript in (("item_1", "What is the capital"), ("item_2", "of Italy?")):
+        await service.handle_evt_input_audio_transcription_completed(
+            SimpleNamespace(
+                type="conversation.item.input_audio_transcription.completed",
+                item_id=item_id,
+                content_index=0,
+                transcript=transcript,
+            )
+        )
+    context.add_messages([{"role": "user", "content": "What is the capital of Italy?"}])
+    sent = len(service.sent)
+
+    await service._handle_context(context)
+
+    assert not [e for e in service.sent[sent:] if e["type"] in ("conversation.item.create", "response.create")]
+    assert not service._boson_server_user_transcripts
+
+
+@pytest.mark.asyncio
+async def test_text_added_after_an_update_was_scanned_is_sent_with_the_next_update():
+    service, context = _ready_service_with_context([])
+    context.add_messages([{"role": "user", "content": "first"}])
+    sent = len(service.sent)
+    typed = service._new_typed_user_messages(context)  # the scan an update does before awaiting
+    context.add_messages([{"role": "user", "content": "second"}])  # arrives while it awaits
+    assert [m["content"] for m in typed] == ["first"]
+
+    await service._handle_context(context)
+
+    assert _sent_texts(service, sent) == ["second"]
+
+
+@pytest.mark.asyncio
+async def test_typed_text_after_a_reconnect_is_sent_once_through_conversation_setup():
+    service, context = _ready_service_with_context([{"role": "assistant", "content": "Hi."}])
+    service._llm_needs_conversation_setup = True
+    context.add_messages([{"role": "user", "content": "hello"}])
+    sent = len(service.sent)
+
+    await service._handle_context(context)
+
+    # Conversation setup sends the whole context, typed text included, once.
+    assert sum("hello" in text for text in _sent_texts(service, sent)) == 1
+    assert service.sent[-1]["type"] == "response.create"
+
+
+@pytest.mark.asyncio
+async def test_direct_append_is_not_sent_again_by_a_later_update():
+    service, context = _ready_service_with_context([])
+    await service._handle_messages_append(
+        LLMMessagesAppendFrame(messages=[{"role": "user", "content": "hello"}], run_llm=True)
+    )
+    sent = len(service.sent)
+
+    await service._handle_context(context)
+
+    assert _sent_texts(service, sent) == []
+
+
+@pytest.mark.asyncio
+async def test_question_appended_after_a_trim_is_sent():
+    a, b = {"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}
+    service, context = _ready_service_with_context([a, b, {"role": "user", "content": "c"}])
+    context.set_messages([a])  # trimmed, with no update in between
+    context.add_messages([{"role": "user", "content": "new question"}])
+    sent = len(service.sent)
+
+    await service._handle_context(context)
+
+    assert _sent_texts(service, sent) == ["new question"]
+
+
+@pytest.mark.asyncio
+async def test_replaced_context_does_not_resend_old_messages():
+    service, context = _ready_service_with_context(
+        [{"role": "user", "content": "a"}, {"role": "user", "content": "b"}]
+    )
+    context.set_messages([{"role": "user", "content": "a"}])
+    sent = len(service.sent)
+
+    await service._handle_context(context)
+
+    assert not [e for e in service.sent[sent:] if e["type"] == "conversation.item.create"]

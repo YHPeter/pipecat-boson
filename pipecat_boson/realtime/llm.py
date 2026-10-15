@@ -260,6 +260,13 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
         self._boson_pending_message_appends: list[LLMMessagesAppendFrame] = []
         self._boson_completed_transcription_item_ids: set[str] = set()
         self._boson_completed_transcription_item_id_order: deque[str] = deque()
+        # The context messages this service has accounted for, by identity
+        # (None until it first sees the context), and the user transcripts the
+        # server produced itself that have not been matched yet. Together they
+        # let _handle_context tell typed user text (to send) from spoken turns
+        # the context aggregator wrote back (already on the server).
+        self._boson_known_messages: dict[int, Any] | None = None
+        self._boson_server_user_transcripts: deque[str] = deque(maxlen=_BOSON_TRANSCRIPTION_DEDUP_CACHE_SIZE)
         self._boson_terminal_session_event_type: str | None = None
         self._boson_response_start_frame_active = False
 
@@ -492,12 +499,85 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
                 self._context.add_messages(frame.messages)
                 run_llm = run_llm or frame.run_llm
             self._boson_pending_message_appends.clear()
+            self._remember_context_messages(context)
             await self._setup_conversation_if_needed()
             if run_llm:
                 await self._create_response()
             return
 
+        # Scan before any await: messages the aggregator adds while this
+        # update is being handled are left for the next one.
+        typed = [] if self._context is None else self._new_typed_user_messages(context)
+        if self._context is None:
+            self._remember_context_messages(context)
         await super()._handle_context(context)
+        if typed:
+            # Text the user typed (RTVI send-text, an LLMMessagesAppendFrame)
+            # reaches the context aggregator first, which adds it to the
+            # context and pushes the updated context here. The base class only
+            # sends new function call results on an update, so send the text
+            # and ask for a reply, as _handle_messages_append does.
+            await self._cancel_active_response()
+            if not self._llm_needs_conversation_setup:
+                await self._send_conversation_messages(typed)
+            # Otherwise (a reconnect), _create_response sets the conversation
+            # up from the whole context, typed text included.
+            await self._create_response()
+
+    def _remember_context_messages(self, context: LLMContext) -> None:
+        self._boson_known_messages = {id(message): message for message in context.get_messages()}
+
+    def _new_typed_user_messages(self, context: LLMContext) -> list[dict[str, Any]]:
+        """User text messages added to the context since this service last looked.
+
+        Messages are tracked by identity, so appends are found wherever the
+        context was trimmed. Only messages after the last one already known
+        count as new: a context replaced wholesale is history, not new input.
+
+        Spoken turns also land in the context, written by the aggregator from
+        the server's own transcripts (one message can join several); those are
+        already on the server and are skipped by matching the transcripts.
+        """
+        messages = context.get_messages()
+        known = self._boson_known_messages
+        self._boson_known_messages = {id(message): message for message in messages}
+        if known is None:
+            return []
+        if known:
+            last_known = max((i for i, message in enumerate(messages) if id(message) in known), default=None)
+            if last_known is None:
+                return []
+        else:
+            last_known = -1  # the context was empty: everything in it now is new
+        typed = []
+        for message in messages[last_known + 1 :]:
+            if id(message) in known or not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            text = _normalize_message_text(message.get("content"))
+            if text and not self._consume_server_transcripts(text):
+                typed.append(message)
+        return typed
+
+    def _consume_server_transcripts(self, text: str) -> bool:
+        """Match ``text`` to consecutive unmatched server transcripts, and drop them.
+
+        The aggregator joins the transcripts of one spoken turn into one
+        message, so compare ignoring whitespace against runs of them.
+        """
+        target = "".join(text.split())
+        transcripts = list(self._boson_server_user_transcripts)
+        for start in range(len(transcripts)):
+            joined = ""
+            for end in range(start, len(transcripts)):
+                joined += "".join(transcripts[end].split())
+                if joined == target:
+                    del transcripts[start : end + 1]
+                    self._boson_server_user_transcripts.clear()
+                    self._boson_server_user_transcripts.extend(transcripts)
+                    return True
+                if not target.startswith(joined):
+                    break
+        return False
 
     async def _handle_messages_append(self, frame: LLMMessagesAppendFrame) -> None:
         if self._context is None:
@@ -505,6 +585,10 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
             return
 
         self._context.add_messages(frame.messages)
+        if self._boson_known_messages is not None:
+            # Sent here; a later context update must not send them again.
+            for message in frame.messages:
+                self._boson_known_messages[id(message)] = message
 
         if frame.run_llm:
             await self._cancel_active_response()
@@ -677,6 +761,9 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
         item_id = getattr(evt, "item_id", None)
         if item_id and not self._mark_transcription_item_completed(item_id):
             return
+        transcript = _normalize_message_text(getattr(evt, "transcript", None))
+        if transcript:
+            self._boson_server_user_transcripts.append(transcript)
         await super().handle_evt_input_audio_transcription_completed(evt)
 
     async def _handle_evt_input_audio_transcription_failed(self, evt) -> None:
@@ -956,6 +1043,15 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
                 )
             if _field_was_set(audio_input, "noise_reduction"):
                 self._boson_input_audio_noise_reduction = _dump_model(audio_input.noise_reduction)
+
+
+def _normalize_message_text(content: Any) -> str:
+    """The text of a message's content (a string or text parts), whitespace-normalized."""
+    if isinstance(content, list):
+        content = " ".join(part.get("text", "") for part in content if isinstance(part, dict))
+    if not isinstance(content, str):
+        return ""
+    return " ".join(content.split())
 
 
 def _loads_ws_message(message: Any) -> dict[str, Any]:
