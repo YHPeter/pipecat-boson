@@ -1211,3 +1211,64 @@ async def test_session_created_event_notifies_application_handler():
 
     assert should_continue is True
     assert received_session_ids == ["24198f53"]
+
+
+def _ready_service_with_context(messages):
+    service = CapturingBosonRealtimeLLMService()
+    service._api_session_ready = True
+    service._llm_needs_conversation_setup = False
+    context = LLMContext(list(messages))
+    service._context = context
+    service._boson_context_cursor = len(messages)
+    return service, context
+
+
+@pytest.mark.asyncio
+async def test_typed_text_added_by_the_context_aggregator_gets_a_reply():
+    # RTVI send-text reaches the user context aggregator first; it adds the
+    # message to the shared context and pushes the updated context downstream.
+    service, context = _ready_service_with_context([{"role": "assistant", "content": "Hi there."}])
+    context.add_messages([{"role": "user", "content": "What is the capital of Italy?"}])
+
+    await service._handle_context(context)
+
+    assert [event["type"] for event in service.sent[-2:]] == ["conversation.item.create", "response.create"]
+    assert service.sent[-2]["item"]["role"] == "user"
+    assert service.sent[-2]["item"]["content"][0]["text"] == "What is the capital of Italy?"
+
+    # The same context pushed again sends nothing new.
+    sent = len(service.sent)
+    await service._handle_context(context)
+    assert len(service.sent) == sent
+
+
+@pytest.mark.asyncio
+async def test_spoken_turn_written_back_to_the_context_is_not_sent_again():
+    service, context = _ready_service_with_context([])
+    await service.handle_evt_input_audio_transcription_completed(
+        SimpleNamespace(
+            type="conversation.item.input_audio_transcription.completed",
+            item_id="item_1",
+            content_index=0,
+            transcript="What is the capital of Italy?",
+        )
+    )
+    context.add_messages([{"role": "user", "content": "What is the capital of  Italy?"}])
+    sent = len(service.sent)
+
+    await service._handle_context(context)
+
+    assert not [e for e in service.sent[sent:] if e["type"] in ("conversation.item.create", "response.create")]
+
+
+@pytest.mark.asyncio
+async def test_replaced_context_does_not_resend_old_messages():
+    service, context = _ready_service_with_context(
+        [{"role": "user", "content": "a"}, {"role": "user", "content": "b"}]
+    )
+    context.set_messages([{"role": "user", "content": "a"}])
+    sent = len(service.sent)
+
+    await service._handle_context(context)
+
+    assert not [e for e in service.sent[sent:] if e["type"] == "conversation.item.create"]

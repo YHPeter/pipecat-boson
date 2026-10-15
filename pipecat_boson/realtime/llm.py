@@ -256,6 +256,12 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
         self._boson_pending_message_appends: list[LLMMessagesAppendFrame] = []
         self._boson_completed_transcription_item_ids: set[str] = set()
         self._boson_completed_transcription_item_id_order: deque[str] = deque()
+        # How far into the shared LLMContext this service has looked, and the
+        # recent user transcripts the server produced itself. Together they let
+        # _handle_context tell typed user text (to send) from spoken turns the
+        # context aggregator wrote back (already on the server).
+        self._boson_context_cursor: int | None = None
+        self._boson_server_user_transcripts: deque[str] = deque(maxlen=_BOSON_TRANSCRIPTION_DEDUP_CACHE_SIZE)
         self._boson_terminal_session_event_type: str | None = None
         self._boson_response_start_frame_active = False
 
@@ -491,9 +497,45 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
             await self._setup_conversation_if_needed()
             if run_llm:
                 await self._create_response()
+            self._boson_context_cursor = len(context.get_messages())
             return
 
+        typed = [] if self._context is None else self._new_typed_user_messages(context)
         await super()._handle_context(context)
+        self._boson_context_cursor = len(context.get_messages())
+        if typed:
+            # Text the user typed (RTVI send-text, an LLMMessagesAppendFrame)
+            # reaches the context aggregator first, which adds it to the
+            # context and pushes the updated context here. The base class only
+            # sends new function call results on an update, so send the text
+            # and ask for a reply, as _handle_messages_append does.
+            await self._cancel_active_response()
+            await self._send_conversation_messages(typed)
+            await self._create_response()
+
+    def _new_typed_user_messages(self, context: LLMContext) -> list[dict[str, Any]]:
+        """User text messages added to the context since the last update.
+
+        Spoken turns also land in the context, written by the aggregator from
+        the server's own transcript; those are already on the server and are
+        skipped by matching that transcript.
+        """
+        messages = context.get_messages()
+        if self._boson_context_cursor is None or self._boson_context_cursor > len(messages):
+            # Not looked at yet (everything already in it is known), or replaced or trimmed.
+            self._boson_context_cursor = len(messages)
+        typed = []
+        for message in messages[self._boson_context_cursor :]:
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            text = _normalize_message_text(message.get("content"))
+            if not text:
+                continue
+            if text in self._boson_server_user_transcripts:
+                self._boson_server_user_transcripts.remove(text)
+                continue
+            typed.append(message)
+        return typed
 
     async def _handle_messages_append(self, frame: LLMMessagesAppendFrame) -> None:
         if self._context is None:
@@ -673,6 +715,9 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
         item_id = getattr(evt, "item_id", None)
         if item_id and not self._mark_transcription_item_completed(item_id):
             return
+        transcript = _normalize_message_text(getattr(evt, "transcript", None))
+        if transcript:
+            self._boson_server_user_transcripts.append(transcript)
         await super().handle_evt_input_audio_transcription_completed(evt)
 
     async def _handle_evt_input_audio_transcription_failed(self, evt) -> None:
@@ -926,6 +971,15 @@ class BosonRealtimeLLMService(OpenAIRealtimeLLMService):
                 )
             if _field_was_set(audio_input, "noise_reduction"):
                 self._boson_input_audio_noise_reduction = _dump_model(audio_input.noise_reduction)
+
+
+def _normalize_message_text(content: Any) -> str:
+    """The text of a message's content (a string or text parts), whitespace-normalized."""
+    if isinstance(content, list):
+        content = " ".join(part.get("text", "") for part in content if isinstance(part, dict))
+    if not isinstance(content, str):
+        return ""
+    return " ".join(content.split())
 
 
 def _loads_ws_message(message: Any) -> dict[str, Any]:
